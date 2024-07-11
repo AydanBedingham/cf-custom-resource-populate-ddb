@@ -1,0 +1,156 @@
+AWSTemplateFormatVersion: "2010-09-09"
+Description: Demonstrates usage of a Lambda-backed Custom Resource to pre-populate a DynamoDB table with hardcoded values
+
+##################################################
+# Mappings
+# - Defines seed data that will be loaded into the DynamoDb table
+# - Modifying the seed data and redeploying the template will cause the table to be updated
+# - CF_MANAGED variable is used to identify seed data entries, ensuring subsequently added rows are not removed
+##################################################
+
+Mappings:
+  MyTable:
+    Table:
+      Items: |
+        [
+          { "Id": "0", "Name":"Foo", "CF_MANAGED": true },
+          { "Id": "1", "Name":"Bar", "CF_MANAGED": true }
+        ]
+
+Resources:
+
+##################################################
+# DynamoDB Table
+##################################################
+
+  MyTable:
+    Type: AWS::DynamoDB::Table
+    UpdateReplacePolicy: Delete
+    DeletionPolicy: Delete
+    Properties: 
+      TableName: MyTable1
+      BillingMode: "PAY_PER_REQUEST"
+      AttributeDefinitions: 
+        - AttributeName: "Id"
+          AttributeType: "S"
+      KeySchema: 
+        - AttributeName: "Id"
+          KeyType: "HASH"
+
+
+##################################################
+# Custom logic used to populate dynamodb table using a lambda-backed custom resource
+# - Defines a lambda-backed custom resource with an 'Items' property
+# - The Items property is deserialized by the lambda function and used to populate a dynamodb table
+# - If the value of the Items property is modified this will cause the lambda-backed custom resource to re-execute the lambda function
+# - This effectively allows us to define the seed data for the dynamodb table within the CF template
+##################################################
+
+  PopulateMyTable:
+    Type: Custom::PopulateDynamoDB
+    Properties:
+      ServiceToken: !GetAtt PopulateMyTableFunction.Arn
+      Items: !FindInMap [ MyTable, Table, Items ]
+      TableName: !Ref MyTable
+      HashKey: 'Id'
+
+  PopulateMyTableFunction:
+    Type: AWS::Lambda::Function
+    Properties:
+      Handler: "index.lambda_handler"
+      Role: !GetAtt PopulateMyTableExecutionRole.Arn
+      Code:
+        ZipFile: |
+          import json
+          import boto3
+          import cfnresponse
+          from boto3.dynamodb.conditions import Attr
+
+          def resource_create(event, context):
+            hash_key = event['ResourceProperties']['HashKey']
+            items = json.loads(event['ResourceProperties']['Items'])
+            dynamodb = boto3.resource('dynamodb')
+            table_name = event['ResourceProperties']['TableName']
+            table = dynamodb.Table(table_name)
+            response = table.scan(FilterExpression=Attr('CF_MANAGED').eq(True))
+            with table.batch_writer() as batch:
+                for item in response['Items']:
+                    batch.delete_item( Key={ hash_key: item[hash_key] } )
+            for item in items:
+                table.put_item(Item=item)
+
+          def resource_update(event, context):
+            resource_create(event, context)
+
+          def resource_delete(event, context):
+            return
+
+          def lambda_handler(event, context):
+            print('event: {}'.format(json.dumps(event)))
+            try:
+              request_type = event.get('RequestType')
+              if request_type == 'Create':
+                resource_create(event, context)
+              elif request_type == 'Update':
+                resource_update(event, context)
+              elif request_type == 'Delete':
+                resource_delete(event, context)
+              else:
+                raise Exception('Unknown RequestType: {}'.format(request_type))
+              cfnresponse.send(event, context, cfnresponse.SUCCESS, {})
+            except Exception as e:
+              cfnresponse.send(event, context, cfnresponse.FAILED, {})
+              raise e
+      Runtime: "python3.8"
+      Timeout: 600
+
+  PopulateMyTableExecutionRole:
+    Type: AWS::IAM::Role
+    Properties:
+      AssumeRolePolicyDocument:
+        Version: "2012-10-17"
+        Statement:
+          - Effect: "Allow"
+            Principal:
+              Service: "lambda.amazonaws.com"
+            Action: "sts:AssumeRole"
+      Policies:
+        - PolicyName: "DynamoDBAccessPolicy"
+          PolicyDocument:
+            Version: "2012-10-17"
+            Statement:
+              - Effect: "Allow"
+                Action:
+                  - "dynamodb:BatchWriteItem"
+                  - "dynamodb:DeleteItem"
+                  - "dynamodb:GetItem"
+                  - "dynamodb:PutItem"
+                  - "dynamodb:Scan"
+                Resource: !GetAtt MyTable.Arn
+        - PolicyName: Logging
+          PolicyDocument:
+            Version: '2012-10-17'
+            Statement:
+              - Effect: Allow
+                Action:
+                  - logs:CreateLogGroup
+                  - logs:CreateLogStream
+                  - logs:PutLogEvents
+                Resource: "arn:aws:logs:*:*:*"
+        - PolicyName: CloudFormationCallback
+          PolicyDocument:
+            Version: '2012-10-17'
+            Statement:
+              - Effect: Allow
+                Action:
+                  - cloudformation:SendResponse
+                Resource: "arn:aws:cloudformation:*:*:*"
+
+##################################################
+# Outputs
+##################################################
+
+Outputs:
+  TableName:
+    Description: "DynamoDB Table Name"
+    Value: !Ref MyTable
